@@ -1,0 +1,276 @@
+Description: >
+    Brandon Canniff
+    AWS Cloudformation IAC server configuration
+
+Parameters:
+    EnvironmentName:
+        Description: To group resources under common prefix
+        Type: String
+        
+    KeyPairName:
+        Description: Bastion host SSH key name
+        Type: String
+
+Resources:
+    LoadBalancerSG:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http to load balancer
+            VpcId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+                IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+
+    BastionSG:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow Bastion Host SSH
+            VpcId:
+                Fn::ImportValue: 
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                CidrIp: 0.0.0.0/0
+                IpProtocol: tcp
+                FromPort: 22
+                ToPort: 22
+            Tags:
+              - Key: Name
+                Value: !Sub "${EnvironmentName} Bastion Host Security Group"
+
+    WebServerSG:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http and SSH requests 
+            VpcId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                    SourceSecurityGroupId: !Ref LoadBalancerSG
+                    IpProtocol: tcp
+                    FromPort: 80
+                    ToPort: 80
+                    SourceSecurityGroupId: !Ref BastionSG
+                    IpProtocol: tcp
+                    FromPort: 22
+                    ToPort: 22
+            SecurityGroupEgress:
+                    IpProtocol: tcp
+                    FromPort: 0
+                    ToPort: 65535
+                    CidrIp: 0.0.0.0/0
+
+    WebAppLaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    apt-get update -y
+                    apt-get install apache2 -y
+                    systemctl start apache2.service
+                    cd /var/www/html
+                    aws s3 cp https://udagram-cf-project.s3.us-east-2.amazonaws.com/index.html.zip
+                    unzip -o index.html.zip
+            ImageId: ami-07c1207a9d40bc3bd
+            IamInstanceProfile: !Ref S3ReadOnlyEC2Profile
+            SecurityGroups:
+              - Ref: WebServerSG
+            InstanceType: t3.medium
+            BlockDeviceMappings:
+              - DeviceName: "/dev/sdk"
+                Ebs:
+                    VolumeSize: "10"
+
+    WebAppGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            VPCZoneIdentifier:
+              - Fn::ImportValue: 
+                  !Sub "${EnvironmentName}-PRIV-NETS"
+            LaunchConfigurationName: !Ref WebAppLaunchConfig
+            MinSize: '3'
+            MaxSize: '5'
+            TargetGroupARNs:
+              - Ref: WebAppTargetGroup
+
+    WebAppTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 30
+            HealthCheckPath: /
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 10
+            HealthyThresholdCount: 2
+            Port: 80
+            Protocol: HTTP
+            UnhealthyThresholdCount: 5
+            VpcId:
+                Fn::ImportValue: 
+                    Fn::Sub: "${EnvironmentName}-VPCID"
+
+    WebAppLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Subnets:
+            - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+            - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+            SecurityGroups: 
+            - Ref: LoadBalancerSG
+
+    Listener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+              - Type: forward
+                TargetGroupArn: !Ref WebAppTargetGroup
+            LoadBalancerArn: !Ref WebAppLB
+            Port: '80'
+            Protocol: HTTP 
+
+    ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+              - Type: forward
+                TargetGroupArn: !Ref WebAppTargetGroup
+            Conditions:
+              - Field: path-pattern
+                Values: [/]
+            ListenerArn: !Ref Listener
+            Priority: 1          
+
+    S3ReadOnlyEC2Profile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles: 
+            - Ref: S3ReadOnlyEC2Role
+
+    S3ReadOnlyEC2Role:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: 
+                !Sub ${EnvironmentName}-S3-Role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    Effect: Allow
+                    Principal:
+                        Service:
+                        - ec2.amazonaws.com
+                    Action:
+                    - sts:AssumeRole
+            Path: "/"
+
+    S3ReadOnlyEC2Policy:
+        Type: AWS::IAM::Policy
+        Properties:
+            PolicyName: S3ReadOnlyEC2Policy
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    Effect: Allow
+                    Action: 
+                    -   s3:Get*
+                    -   s3:List*
+                    Resource: 
+                    -   arn:aws:s3:::udagram-cf-project
+                    -   arn:aws:s3:::udagram-cf-project/*
+            Roles:
+            - Ref: S3ReadOnlyEC2Role
+
+    BastionPublicSubnet1:
+        Type: AWS::EC2::Instance
+        Properties:
+            ImageId: ami-07c1207a9d40bc3bd
+            InstanceType: t3.small
+            KeyName: !Ref KeyPairName
+            SubnetId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-PUB1-SN"
+            AvailabilityZone: !Select [ 0, !GetAZs '' ]
+            SecurityGroupIds: 
+            - Ref: BastionSG
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName} Bastion Host 1
+
+    BastionPublicSubnet2:
+        Type: AWS::EC2::Instance
+        Properties:
+            ImageId: ami-07c1207a9d40bc3bd
+            InstanceType: t3.small
+            KeyName: !Ref KeyPairName
+            SubnetId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-PUB2-SN"
+            AvailabilityZone: !Select [ 1, !GetAZs '' ]
+            SecurityGroupIds: 
+            - Ref: BastionSG
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName} Bastion Host 2
+                
+    BastionEIP1:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: 
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            InstanceId: !Ref BastionPublicSubnet1
+
+    EIPAssociation:
+        Type: AWS::EC2::EIPAssociation
+        Properties:
+            InstanceId: !Ref BastionPublicSubnet1
+            #EIP: !Ref BastionEIP1
+            AllocationId:
+                Fn::GetAtt:
+                - BastionEIP1
+                - AllocationId
+
+    BastionEIP2:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: 
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            InstanceId: !Ref BastionPublicSubnet2
+
+    EIPAssociation2:
+        Type: AWS::EC2::EIPAssociation
+        Properties:
+            InstanceId: !Ref BastionPublicSubnet2
+            #EIP: !Ref BastionEIP2
+            AllocationId:
+                Fn::GetAtt:
+                - BastionEIP2
+                - AllocationId
+
+Outputs:
+    LoadBalancerDNS:
+        Description: URL/DNS of web app
+        Value: !Join ["", ['http://', !GetAtt WebAppLB.DNSName]]
+        Export:
+            Name: !Sub "${EnvironmentName}-LB-DNS"
+
+    BastionDNS1:
+        Description: DNS of public subnet 1 bastion host
+        Value: !GetAtt BastionPublicSubnet1.PublicDnsName
+        Export:
+            Name: !Sub "${EnvironmentName}-BASTION-DNS-PUB1"
+
+    BastionDNS2:
+        Description: DNS of public subnet 2 bastion host
+        Value: !GetAtt BastionPublicSubnet1.PublicDnsName
+        Export:
+            Name: !Sub "${EnvironmentName}-BASTION-DNS-PUB2"
